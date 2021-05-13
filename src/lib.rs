@@ -155,7 +155,7 @@ impl Default for Options {
             sideways_pan_in_points: 0.0,
             view: View::Latest,
 
-            scroll_zoom_speed: 0.02,
+            scroll_zoom_speed: 0.01,
 
             cull_width: 0.5,
             rect_height: 16.0,
@@ -167,10 +167,10 @@ impl Default for Options {
     }
 }
 
-struct Info<'ui> {
-    // Bounding box of canvas in points:
+struct Info {
+    ctx: egui::CtxRef,
+    /// Bounding box of canvas in points:
     canvas: Rect,
-    ui: &'ui mut Ui,
     /// Interaction with the profiler canvas
     response: Response,
     painter: egui::Painter,
@@ -186,7 +186,7 @@ enum PaintResult {
     Normal,
 }
 
-impl<'ui> Info<'ui> {
+impl Info {
     fn point_from_ns(&self, options: &Options, ns: NanoSecond) -> f32 {
         self.canvas.min.x
             + options.sideways_pan_in_points
@@ -271,7 +271,7 @@ impl ProfilerUi {
         };
 
         ui.horizontal(|ui| {
-            ui.label("Pan using left mouse button. Drag up/down to zoom, or use scroll.");
+            ui.label("Drag to pan. Scroll to zoom.");
 
             if ui.button("Reset view").clicked() {
                 self.options.canvas_width_ns = 0.0;
@@ -304,8 +304,8 @@ impl ProfilerUi {
             ui.allocate_painter(ui.available_size_before_wrap_finite(), Sense::drag());
 
         let mut info = Info {
+            ctx: ui.ctx().clone(),
             canvas: response.rect,
-            ui,
             response,
             painter,
             text_height: 15.0, // TODO
@@ -368,35 +368,20 @@ impl ProfilerUi {
         }
     }
 
-    fn interact(&mut self, info: &Info<'_>) {
-        let ui = &info.ui;
-
-        let pan_button = PointerButton::Primary;
-        let is_panning = info.response.dragged_by(pan_button);
-
-        let pan_delta = if is_panning {
-            ui.input().pointer.delta()
-        } else {
-            Vec2::ZERO
-        };
-
-        if is_panning {
-            self.options.sideways_pan_in_points += pan_delta.x;
-        }
+    fn interact(&mut self, info: &Info) {
+        self.options.sideways_pan_in_points += info.response.drag_delta().x;
 
         if info.response.hovered() {
             // Sideways pan with e.g. a touch pad:
-            self.options.sideways_pan_in_points += ui.input().scroll_delta.x;
+            self.options.sideways_pan_in_points += info.ctx.input().scroll_delta.x;
 
-            let zoom_factor = if is_panning {
-                (-pan_delta.y * 0.01).exp()
-            } else {
-                (ui.input().scroll_delta.y * self.options.scroll_zoom_speed).exp()
-            };
+            let scroll_zoom =
+                (info.ctx.input().scroll_delta.y * self.options.scroll_zoom_speed).exp();
+            let zoom_factor = scroll_zoom * info.ctx.input().zoom_delta_2d().x;
 
             self.options.canvas_width_ns /= zoom_factor;
 
-            if let Some(mouse_pos) = ui.input().pointer.hover_pos() {
+            if let Some(mouse_pos) = info.response.hover_pos() {
                 let zoom_center = mouse_pos.x - info.canvas.min.x;
                 self.options.sideways_pan_in_points =
                     (self.options.sideways_pan_in_points - zoom_center) * zoom_factor + zoom_center;
@@ -405,7 +390,7 @@ impl ProfilerUi {
     }
 }
 
-fn paint_timeline(info: &Info<'_>, options: &Options, start_ns: NanoSecond, stop_ns: NanoSecond) {
+fn paint_timeline(info: &Info, options: &Options, start_ns: NanoSecond, stop_ns: NanoSecond) {
     if options.canvas_width_ns <= 0.0 {
         return;
     }
@@ -508,7 +493,7 @@ fn grid_text(grid_ns: NanoSecond) -> String {
 }
 
 fn paint_record(
-    info: &Info<'_>,
+    info: &Info,
     options: &Options,
     prefix: &str,
     record: &Record<'_>,
@@ -597,7 +582,7 @@ fn to_ms(ns: NanoSecond) -> f64 {
 }
 
 fn paint_scope(
-    info: &Info<'_>,
+    info: &Info,
     options: &Options,
     stream: &Stream,
     scope: &Scope<'_>,
@@ -617,24 +602,20 @@ fn paint_scope(
         }
 
         if result == PaintResult::Hovered {
-            egui::show_tooltip_at_pointer(
-                info.ui.ctx(),
-                Id::new("puffin_profiler_tooltip"),
-                |ui| {
-                    ui.monospace(format!("id:       {}", scope.record.id));
-                    if !scope.record.location.is_empty() {
-                        ui.monospace(format!("location: {}", scope.record.location));
-                    }
-                    if !scope.record.data.is_empty() {
-                        ui.monospace(format!("data:     {}", scope.record.data));
-                    }
-                    ui.monospace(format!(
-                        "duration: {:6.3} ms",
-                        to_ms(scope.record.duration_ns)
-                    ));
-                    ui.monospace(format!("children: {}", num_children));
-                },
-            );
+            egui::show_tooltip_at_pointer(&info.ctx, Id::new("puffin_profiler_tooltip"), |ui| {
+                ui.monospace(format!("id:       {}", scope.record.id));
+                if !scope.record.location.is_empty() {
+                    ui.monospace(format!("location: {}", scope.record.location));
+                }
+                if !scope.record.data.is_empty() {
+                    ui.monospace(format!("data:     {}", scope.record.data));
+                }
+                ui.monospace(format!(
+                    "duration: {:6.3} ms",
+                    to_ms(scope.record.duration_ns)
+                ));
+                ui.monospace(format!("children: {}", num_children));
+            });
         }
     }
 
@@ -642,7 +623,7 @@ fn paint_scope(
 }
 
 fn paint_merge_scope(
-    info: &Info<'_>,
+    info: &Info,
     options: &Options,
     stream: &Stream,
     merge: &MergeScope<'_>,
@@ -665,11 +646,9 @@ fn paint_merge_scope(
         }
 
         if result == PaintResult::Hovered {
-            egui::show_tooltip_at_pointer(
-                info.ui.ctx(),
-                Id::new("puffin_profiler_tooltip"),
-                |ui| merge_scope_tooltip(ui, merge),
-            );
+            egui::show_tooltip_at_pointer(&info.ctx, Id::new("puffin_profiler_tooltip"), |ui| {
+                merge_scope_tooltip(ui, merge)
+            });
         }
     }
 
@@ -711,13 +690,13 @@ fn merge_scope_tooltip(ui: &mut egui::Ui, merge: &MergeScope<'_>) {
     }
 }
 
-fn paint_thread_info(info: &Info<'_>, thread: &ThreadInfo, stream: &Stream, pos: Pos2) {
+fn paint_thread_info(info: &Info, thread: &ThreadInfo, stream: &Stream, pos: Pos2) {
     let text = format!(
         "{} ({:.1} kiB profiler data)",
         thread.name,
         stream.len() as f32 / 1024.0
     );
-    let galley = info.ui.fonts().layout_single_line(TEXT_STYLE, text);
+    let galley = info.ctx.fonts().layout_single_line(TEXT_STYLE, text);
     let rect = Rect::from_min_size(pos, galley.size);
 
     info.painter

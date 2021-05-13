@@ -2,7 +2,8 @@ use eframe::{egui, epi};
 
 fn main() {
     let app = ExampleApp::default();
-    eframe::run_native(Box::new(app));
+    let options = Default::default();
+    eframe::run_native(Box::new(app), options);
 }
 
 #[derive(Default)]
