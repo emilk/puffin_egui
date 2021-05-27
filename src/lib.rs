@@ -60,12 +60,14 @@
     nonstandard_style,
     rust_2018_idioms
 )]
+#![allow(clippy::float_cmp)]
 #![allow(clippy::manual_range_contains)]
 
 pub use {egui, puffin};
 
 use egui::*;
 use puffin::*;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 // ----------------------------------------------------------------------------
@@ -99,7 +101,22 @@ pub fn profiler_ui(ui: &mut egui::Ui) {
 // ----------------------------------------------------------------------------
 
 const ERROR_COLOR: Color32 = Color32::RED;
+const HOVER_COLOR: Rgba = Rgba::from_rgb(0.8, 0.8, 0.8);
 const TEXT_STYLE: TextStyle = TextStyle::Body;
+
+/// The frames we can select between
+#[derive(Clone)]
+pub struct Frames {
+    pub recent: Vec<Arc<FrameData>>,
+    pub slowest: Vec<Arc<FrameData>>,
+}
+
+#[derive(Clone)]
+pub struct Paused {
+    /// What we are viewing
+    selected: Arc<FrameData>,
+    frames: Frames,
+}
 
 /// Contains settings for the profiler.
 #[derive(Clone, Default)]
@@ -108,15 +125,9 @@ const TEXT_STYLE: TextStyle = TextStyle::Body;
 pub struct ProfilerUi {
     options: Options,
 
+    /// If `None`, we show the latest frames.
     #[cfg_attr(feature = "serde", serde(skip))]
-    paused_data: Option<FullProfileData>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-enum View {
-    Latest,
-    Spike,
+    paused: Option<Paused>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,8 +140,6 @@ struct Options {
 
     /// How much we have panned sideways:
     sideways_pan_in_points: f32,
-
-    view: View,
 
     // --------------------
     // Interact:
@@ -146,6 +155,11 @@ struct Options {
 
     /// Aggregate child scopes with the same id?
     merge_scopes: bool,
+
+    /// Set when user clicks a scope.
+    /// First part is `now()`, second is range.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    zoom_to_relative_ns_range: Option<(f64, (NanoSecond, NanoSecond))>,
 }
 
 impl Default for Options {
@@ -153,7 +167,6 @@ impl Default for Options {
         Self {
             canvas_width_ns: 0.0,
             sideways_pan_in_points: 0.0,
-            view: View::Latest,
 
             scroll_zoom_speed: 0.01,
 
@@ -163,10 +176,13 @@ impl Default for Options {
             rounding: 4.0,
 
             merge_scopes: true,
+
+            zoom_to_relative_ns_range: None,
         }
     }
 }
 
+/// Context for painting a frame.
 struct Info {
     ctx: egui::CtxRef,
     /// Bounding box of canvas in points:
@@ -177,6 +193,8 @@ struct Info {
     text_height: f32,
     /// Time of first event
     start_ns: NanoSecond,
+    /// Time of last event
+    stop_ns: NanoSecond,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -191,6 +209,14 @@ impl Info {
         self.canvas.min.x
             + options.sideways_pan_in_points
             + self.canvas.width() * ((ns - self.start_ns) as f32) / options.canvas_width_ns
+    }
+}
+
+fn latest_frames() -> Frames {
+    let profiler = GlobalProfiler::lock();
+    Frames {
+        recent: profiler.recent_frames().cloned().collect(),
+        slowest: profiler.slowest_frames_chronological(),
     }
 }
 
@@ -210,6 +236,36 @@ impl ProfilerUi {
         open
     }
 
+    /// The frames we can select between
+    fn frames(&self) -> Frames {
+        self.paused
+            .as_ref()
+            .map_or_else(latest_frames, |paused| paused.frames.clone())
+    }
+
+    /// Pause on the specific frame
+    fn pause_and_select(&mut self, selected: Arc<FrameData>) {
+        if let Some(paused) = &mut self.paused {
+            paused.selected = selected;
+        } else {
+            self.paused = Some(Paused {
+                selected,
+                frames: self.frames(),
+            });
+        }
+    }
+
+    fn selected_frame(&self) -> Option<Arc<FrameData>> {
+        self.paused
+            .as_ref()
+            .map(|paused| paused.selected.clone())
+            .or_else(|| GlobalProfiler::lock().latest_frame())
+    }
+
+    fn selected_frame_index(&self) -> Option<FrameIndex> {
+        self.selected_frame().map(|frame| frame.frame_index)
+    }
+
     /// Show the profiler.
     ///
     /// Call this from within an [`egui::Window`], or use [`Self::window`] instead.
@@ -222,80 +278,70 @@ impl ProfilerUi {
                 .on_hover_text("Turn it on with puffin::set_scopes_on(true)");
         }
 
-        ui.horizontal(|ui| {
-            let mut view = self.options.view;
-            ui.label("Show:");
-            ui.radio_value(&mut view, View::Latest, "Latest frame");
-            ui.radio_value(&mut view, View::Spike, "Frame spike");
-            if view != self.options.view {
-                self.options.view = view;
-                self.paused_data = None;
-            }
-            if self.paused_data.is_none() {
-                if ui.button("Pause").clicked() {
-                    self.paused_data = Some(self.get_latest_data());
+        let mut hovered_frame = None;
+
+        egui::CollapsingHeader::new("Frames")
+            .default_open(true)
+            .show(ui, |ui| {
+                hovered_frame = self.show_frames(ui);
+
+                if self.paused.is_some() {
+                    if ui.button("Resume / Show latest").clicked() {
+                        self.paused = None;
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui.button("Pause").clicked() {
+                            let latest = GlobalProfiler::lock().latest_frame();
+                            if let Some(latest) = latest {
+                                self.pause_and_select(latest);
+                            }
+                        }
+                        if ui.button("Forget slowest frames").clicked() {
+                            GlobalProfiler::lock().clear_slowest();
+                        }
+                    });
                 }
-            } else {
-                if ui.button("Resume").clicked() {
-                    self.paused_data = None;
-                }
-            }
-            ui.checkbox(
-                &mut self.options.merge_scopes,
-                "Merge children with same ID",
-            );
+            });
 
-            if self.options.view == View::Spike && ui.button("Clear current spike").clicked() {
-                GlobalProfiler::lock().clear_spike_frame();
-                self.paused_data = None;
-            }
-        });
-
-        let profile_data = self
-            .paused_data
-            .clone()
-            .unwrap_or_else(|| self.get_latest_data());
-
-        // TODO: show age of data
-
-        let (min_ns, max_ns) = match profile_data.range_ns() {
-            Err(err) => {
-                ui.colored_label(ERROR_COLOR, format!("Profile data error: {:?}", err));
-                return;
-            }
-            Ok(Some(bounds)) => bounds,
-            Ok(None) => {
+        let frame = match hovered_frame.or_else(|| self.selected_frame()) {
+            Some(frame) => frame,
+            None => {
                 ui.label("No profiling data");
                 return;
             }
         };
 
-        ui.horizontal(|ui| {
-            ui.label("Drag to pan. Scroll to zoom.");
+        // TODO: show age of data
 
-            if ui.button("Reset view").clicked() {
-                self.options.canvas_width_ns = 0.0;
-                self.options.sideways_pan_in_points = 0.0;
-            }
+        let (min_ns, max_ns) = frame.range_ns;
+
+        ui.label(format!(
+            "Current frame: {:.1} ms, {} threads, {} scopes, {:.1} kB",
+            (max_ns - min_ns) as f64 * 1e-6,
+            frame.thread_streams.len(),
+            frame.num_scopes,
+            frame.num_bytes as f64 * 1e-3
+        ));
+
+        ui.horizontal(|ui| {
+            ui.label("Drag to pan. Scroll to zoom. Click to focus. Double-click to reset.");
+
+            ui.checkbox(
+                &mut self.options.merge_scopes,
+                "Merge children with same ID",
+            );
         });
 
         Frame::dark_canvas(ui.style()).show(ui, |ui| {
-            self.ui_canvas(ui, &profile_data, (min_ns, max_ns));
+            self.ui_canvas(ui, &frame, (min_ns, max_ns));
         });
-    }
-
-    fn get_latest_data(&self) -> FullProfileData {
-        let profiler = GlobalProfiler::lock();
-        match self.options.view {
-            View::Latest => profiler.past_frame().clone(),
-            View::Spike => profiler.spike_frame().clone(),
-        }
     }
 
     fn ui_canvas(
         &mut self,
         ui: &mut egui::Ui,
-        profile_data: &FullProfileData,
+        frame: &FrameData,
         (min_ns, max_ns): (NanoSecond, NanoSecond),
     ) {
         puffin::profile_function!();
@@ -310,21 +356,22 @@ impl ProfilerUi {
             painter,
             text_height: 15.0, // TODO
             start_ns: min_ns,
+            stop_ns: max_ns,
         };
-        self.interact(&info);
+        self.interact_with_canvas(&info);
 
         if self.options.canvas_width_ns <= 0.0 {
             self.options.canvas_width_ns = (max_ns - min_ns) as f32;
+            self.options.zoom_to_relative_ns_range = None;
         }
 
-        let options = &self.options;
-        paint_timeline(&info, options, min_ns, max_ns);
+        paint_timeline(&info, &self.options, min_ns, max_ns);
 
         // We paint the threads bottom up
         let mut cursor_y = info.canvas.max.y;
         cursor_y -= info.text_height; // Leave room for time labels
 
-        for (thread, stream) in &profile_data.0 {
+        for (thread, stream) in &frame.thread_streams {
             // Visual separator between threads:
             info.painter.line_segment(
                 [
@@ -336,19 +383,26 @@ impl ProfilerUi {
 
             cursor_y -= info.text_height;
             let text_pos = pos2(info.canvas.min.x, cursor_y);
-            paint_thread_info(&info, thread, stream, text_pos);
+            paint_thread_info(&info, thread, text_pos);
             info.canvas.max.y = cursor_y;
 
             let mut paint_stream = || -> Result<()> {
                 let top_scopes = Reader::from_start(stream).read_top_scopes()?;
-                if options.merge_scopes {
+                if self.options.merge_scopes {
                     let merges = puffin::merge_top_scopes(&top_scopes);
                     for merge in merges {
-                        paint_merge_scope(&info, options, stream, &merge, 0, &mut cursor_y)?;
+                        paint_merge_scope(
+                            &info,
+                            &mut self.options,
+                            stream,
+                            &merge,
+                            0,
+                            &mut cursor_y,
+                        )?;
                     }
                 } else {
                     for scope in top_scopes {
-                        paint_scope(&info, options, stream, &scope, 0, &mut cursor_y)?;
+                        paint_scope(&info, &mut self.options, stream, &scope, 0, &mut cursor_y)?;
                     }
                 }
                 Ok(())
@@ -368,24 +422,163 @@ impl ProfilerUi {
         }
     }
 
-    fn interact(&mut self, info: &Info) {
-        self.options.sideways_pan_in_points += info.response.drag_delta().x;
+    /// Returns hovered, if any
+    fn show_frames(&mut self, ui: &mut egui::Ui) -> Option<Arc<FrameData>> {
+        let frames = self.frames();
+
+        let mut hovered_frame = None;
+
+        let longest_count = frames.recent.len().max(frames.slowest.len());
+
+        ui.label("Recent history:");
+        Frame::dark_canvas(ui.style()).show(ui, |ui| {
+            self.show_frame_list(ui, &frames.recent, longest_count, &mut hovered_frame);
+        });
+        ui.label("Slowest frames:");
+        Frame::dark_canvas(ui.style()).show(ui, |ui| {
+            self.show_frame_list(ui, &frames.slowest, longest_count, &mut hovered_frame);
+        });
+
+        hovered_frame
+    }
+
+    fn show_frame_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        frames: &[Arc<FrameData>],
+        longest_count: usize,
+        hovered_frame: &mut Option<Arc<FrameData>>,
+    ) {
+        let mut slowest_frame = 0;
+        for frame in frames {
+            slowest_frame = frame.duration_ns().max(slowest_frame);
+        }
+
+        let desired_size = Vec2::new(ui.available_size_before_wrap_finite().x, 48.0);
+        let (response, painter) = ui.allocate_painter(desired_size, Sense::drag());
+        let rect = response.rect;
+
+        let frame_width_including_spacing =
+            (rect.width() / (longest_count as f32)).max(4.0).min(20.0);
+        let frame_spacing = 2.0;
+        let frame_width = frame_width_including_spacing - frame_spacing;
+
+        let selected_frame_index = self.selected_frame_index();
+
+        for (i, frame) in frames.iter().enumerate() {
+            let x = rect.right() - (frames.len() as f32 - i as f32) * frame_width_including_spacing;
+            let frame_rect = Rect::from_min_max(
+                Pos2::new(x, rect.top()),
+                Pos2::new(x + frame_width, rect.bottom()),
+            );
+
+            let duration = frame.duration_ns();
+
+            let is_selected = Some(frame.frame_index) == selected_frame_index;
+
+            let is_hovered = if let Some(mouse_pos) = response.hover_pos() {
+                response.hovered()
+                    && frame_rect
+                        .expand2(vec2(0.5 * frame_spacing, 0.0))
+                        .contains(mouse_pos)
+            } else {
+                false
+            };
+
+            if is_hovered {
+                *hovered_frame = Some(frame.clone());
+                egui::show_tooltip_at_pointer(ui.ctx(), Id::new("puffin_frame_tooltip"), |ui| {
+                    ui.label(format!("{:.1} ms", frame.duration_ns() as f64 * 1e-6));
+                });
+            }
+            if is_hovered && response.clicked() {
+                self.pause_and_select(frame.clone());
+            }
+
+            let color = if is_selected {
+                Rgba::WHITE
+            } else if is_hovered {
+                HOVER_COLOR
+            } else {
+                Rgba::from_rgb(0.6, 0.6, 0.4)
+            };
+
+            // Transparent, full height:
+            let alpha = if is_selected || is_hovered { 0.6 } else { 0.25 };
+            painter.rect_filled(frame_rect, 0.0, color * alpha);
+
+            // Opaque, height based on duration:
+            let mut short_rect = frame_rect;
+            short_rect.min.y = lerp(
+                frame_rect.bottom_up_range(),
+                duration as f32 / slowest_frame as f32,
+            );
+            painter.rect_filled(short_rect, 0.0, color);
+        }
+    }
+
+    fn interact_with_canvas(&mut self, info: &Info) {
+        if info.response.drag_delta().x != 0.0 {
+            self.options.sideways_pan_in_points += info.response.drag_delta().x;
+            self.options.zoom_to_relative_ns_range = None;
+        }
 
         if info.response.hovered() {
             // Sideways pan with e.g. a touch pad:
-            self.options.sideways_pan_in_points += info.ctx.input().scroll_delta.x;
+            if info.ctx.input().scroll_delta.x != 0.0 {
+                self.options.sideways_pan_in_points += info.ctx.input().scroll_delta.x;
+                self.options.zoom_to_relative_ns_range = None;
+            }
 
             let scroll_zoom =
                 (info.ctx.input().scroll_delta.y * self.options.scroll_zoom_speed).exp();
             let zoom_factor = scroll_zoom * info.ctx.input().zoom_delta_2d().x;
 
-            self.options.canvas_width_ns /= zoom_factor;
+            if zoom_factor != 1.0 {
+                self.options.canvas_width_ns /= zoom_factor;
 
-            if let Some(mouse_pos) = info.response.hover_pos() {
-                let zoom_center = mouse_pos.x - info.canvas.min.x;
-                self.options.sideways_pan_in_points =
-                    (self.options.sideways_pan_in_points - zoom_center) * zoom_factor + zoom_center;
+                if let Some(mouse_pos) = info.response.hover_pos() {
+                    let zoom_center = mouse_pos.x - info.canvas.min.x;
+                    self.options.sideways_pan_in_points =
+                        (self.options.sideways_pan_in_points - zoom_center) * zoom_factor
+                            + zoom_center;
+                }
+                self.options.zoom_to_relative_ns_range = None;
             }
+        }
+
+        if info.response.double_clicked() {
+            // Reset view
+            self.options.zoom_to_relative_ns_range =
+                Some((info.ctx.input().time, (0, info.stop_ns - info.start_ns)));
+        }
+
+        if let Some((start_time, (start_ns, end_ns))) = self.options.zoom_to_relative_ns_range {
+            const ZOOM_DURATION: f32 = 0.75;
+            let t = ((info.ctx.input().time - start_time) as f32 / ZOOM_DURATION).min(1.0);
+
+            let canvas_width = info.response.rect.width();
+
+            let target_canvas_width_ns = (end_ns - start_ns) as f32;
+            let target_pan_in_points = -canvas_width * start_ns as f32 / target_canvas_width_ns;
+
+            // self.options.canvas_width_ns =
+            //     lerp(self.options.canvas_width_ns..=target_canvas_width_ns, t);
+            self.options.canvas_width_ns = lerp(
+                self.options.canvas_width_ns.recip()..=target_canvas_width_ns.recip(),
+                t,
+            )
+            .recip();
+            self.options.sideways_pan_in_points = lerp(
+                self.options.sideways_pan_in_points..=target_pan_in_points,
+                t,
+            );
+
+            if t >= 1.0 {
+                self.options.zoom_to_relative_ns_range = None;
+            }
+
+            info.ctx.request_repaint();
         }
     }
 }
@@ -494,7 +687,7 @@ fn grid_text(grid_ns: NanoSecond) -> String {
 
 fn paint_record(
     info: &Info,
-    options: &Options,
+    options: &mut Options,
     prefix: &str,
     record: &Record<'_>,
     top_y: f32,
@@ -517,10 +710,20 @@ fn paint_record(
         false
     };
 
+    if is_hovered && info.response.clicked() {
+        options.zoom_to_relative_ns_range = Some((
+            info.ctx.input().time,
+            (
+                record.start_ns - info.start_ns,
+                record.stop_ns() - info.start_ns,
+            ),
+        ));
+    }
+
     let rect_min = pos2(start_x, top_y);
     let rect_max = pos2(stop_x, bottom_y);
     let rect_color = if is_hovered {
-        Rgba::from_rgb(1.0, 0.5, 0.5)
+        HOVER_COLOR
     } else {
         // options.rect_color
         color_from_duration(record.duration_ns)
@@ -572,7 +775,7 @@ fn color_from_duration(ns: NanoSecond) -> Rgba {
     // So we start with dark colors (blue) and later bright colors (green).
     let b = remap_clamp(ms, 0.0..=5.0, 1.0..=0.3);
     let r = remap_clamp(ms, 0.0..=10.0, 0.5..=0.8);
-    let g = remap_clamp(ms, 10.0..=20.0, 0.1..=0.8);
+    let g = remap_clamp(ms, 10.0..=33.0, 0.1..=0.8);
     let a = 0.9;
     Rgba::from_rgb(r, g, b) * a
 }
@@ -583,7 +786,7 @@ fn to_ms(ns: NanoSecond) -> f64 {
 
 fn paint_scope(
     info: &Info,
-    options: &Options,
+    options: &mut Options,
     stream: &Stream,
     scope: &Scope<'_>,
     depth: usize,
@@ -624,7 +827,7 @@ fn paint_scope(
 
 fn paint_merge_scope(
     info: &Info,
-    options: &Options,
+    options: &mut Options,
     stream: &Stream,
     merge: &MergeScope<'_>,
     depth: usize,
@@ -690,13 +893,11 @@ fn merge_scope_tooltip(ui: &mut egui::Ui, merge: &MergeScope<'_>) {
     }
 }
 
-fn paint_thread_info(info: &Info, thread: &ThreadInfo, stream: &Stream, pos: Pos2) {
-    let text = format!(
-        "{} ({:.1} kiB profiler data)",
-        thread.name,
-        stream.len() as f32 / 1024.0
-    );
-    let galley = info.ctx.fonts().layout_single_line(TEXT_STYLE, text);
+fn paint_thread_info(info: &Info, thread: &ThreadInfo, pos: Pos2) {
+    let galley = info
+        .ctx
+        .fonts()
+        .layout_single_line(TEXT_STYLE, thread.name.clone());
     let rect = Rect::from_min_size(pos, galley.size);
 
     info.painter

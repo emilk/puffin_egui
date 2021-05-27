@@ -14,6 +14,8 @@ fn window_conf() -> Conf {
 async fn main() {
     puffin::set_scopes_on(true); // Remember to call this, or puffin will be disabled!
 
+    let mut frame_counter = 0;
+
     while !should_quit() {
         puffin::profile_scope!("main_loop");
 
@@ -30,14 +32,22 @@ async fn main() {
         // Draw things behind egui here
 
         {
-            puffin::profile_scope!("egui_macroquad::draw");
+            puffin::profile_scope!("draw");
             egui_macroquad::draw();
         }
 
         // Draw things on top of egui here
 
-        sleep_ms(14); // Give us something to inspect
+        // Give us something to inspect:
+        sleep_ms(14);
+        if frame_counter % 7 == 0 {
+            puffin::profile_scope!("Spike");
+            std::thread::sleep(std::time::Duration::from_millis(10))
+        }
 
+        frame_counter += 1;
+
+        puffin::profile_scope!("next_frame");
         next_frame().await;
     }
 }

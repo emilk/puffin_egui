@@ -7,7 +7,9 @@ fn main() {
 }
 
 #[derive(Default)]
-pub struct ExampleApp {}
+pub struct ExampleApp {
+    frame_counter: u64,
+}
 
 impl epi::App for ExampleApp {
     fn name(&self) -> &str {
@@ -24,7 +26,14 @@ impl epi::App for ExampleApp {
 
         puffin_egui::profiler_window(ctx);
 
-        sleep_ms(14); // Give us something to inspect
+        // Give us something to inspect:
+        sleep_ms(14);
+        if self.frame_counter % 7 == 0 {
+            puffin::profile_scope!("Spike");
+            std::thread::sleep(std::time::Duration::from_millis(10))
+        }
+
+        self.frame_counter += 1;
     }
 }
 
