@@ -5,6 +5,9 @@ All notable changes to the egui crate will be documented in this file.
 
 ## Unreleased
 
+
+## 0.3.0 - 2021-05-27
+
 * History viewer.
 * Update to puffin 0.5.1.
 
