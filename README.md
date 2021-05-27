@@ -25,7 +25,7 @@ fn my_function() {
 puffin_egui::profiler_window(egui_ctx);
 ```
 
-<img src="media/demo-2021-05-05.gif">
+<img src="media/demo-2021-05-27.gif">
 
 See the [`examples/`](examples/) folder for how to use it with [`eframe`](docs.rs/eframe) or [`macroquad`](https://github.com/not-fl3/macroquad).
 
